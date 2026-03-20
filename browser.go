@@ -60,6 +60,13 @@ type Browser struct {
 	// map once a browser is closed.
 	pages map[target.SessionID]*Target
 
+	// autoAttachedSessions tracks sessions created by SetAutoAttach
+	// (EventAttachedToTarget) that were NOT created via AttachToTarget.
+	// These sessions are not in pages, so without this map their incoming
+	// messages would be silently dropped and commands on them would fail.
+	// Keyed by SessionID; concurrent access is safe via sync.Map.
+	autoAttachedSessions sync.Map // target.SessionID -> *Target
+
 	listenersMu sync.Mutex
 	listeners   []cancelableListener
 
@@ -179,6 +186,44 @@ func (b *Browser) newExecutorForTarget(ctx context.Context, targetID target.ID, 
 	return t, nil
 }
 
+// registerAutoAttachedSession creates a Target for a session that was
+// auto-attached via SetAutoAttach (EventAttachedToTarget) rather than via an
+// explicit AttachToTarget call. The Target is registered in autoAttachedSessions
+// so that its incoming messages are routed and commands can be sent on it.
+// ctx should be the context of the parent target so the session is cancelled
+// when the parent is cancelled. Concurrent calls for the same sessionID are
+// safe; only the first call takes effect.
+func (b *Browser) registerAutoAttachedSession(ctx context.Context, sessionID target.SessionID, targetID target.ID) {
+	t := &Target{
+		browser:      b,
+		TargetID:     targetID,
+		SessionID:    sessionID,
+		messageQueue: make(chan *cdproto.Message, 1024),
+		frames:       make(map[cdp.FrameID]*cdp.Frame),
+		execContexts: make(map[cdp.FrameID]runtime.ExecutionContextID),
+		cur:          cdp.FrameID(targetID),
+		logf:         b.logf,
+		errf:         b.errf,
+	}
+	if _, loaded := b.autoAttachedSessions.LoadOrStore(sessionID, t); loaded {
+		return // already registered
+	}
+	go t.run(ctx)
+}
+
+// SessionExecutor returns a CDP executor for the given auto-attached session ID.
+// This is the primary API for interacting with sessions created by
+// Target.SetAutoAttach with waitForDebugger (e.g. to call
+// Runtime.runIfWaitingForDebugger on a paused OOPIF).
+//
+// Returns (executor, true) if the session is known, or (nil, false) if not.
+func (b *Browser) SessionExecutor(sessionID target.SessionID) (cdp.Executor, bool) {
+	if val, ok := b.autoAttachedSessions.Load(sessionID); ok {
+		return val.(*Target), true
+	}
+	return nil, false
+}
+
 func (b *Browser) Execute(ctx context.Context, method string, params, res any) error {
 	// Certain methods aren't available to the user directly.
 	if method == browser.CommandClose {
@@ -280,6 +325,13 @@ func (b *Browser) run(ctx context.Context) {
 					b.errf("%s", err)
 					continue
 				}
+
+				// Register auto-attached sessions before notifying listeners so
+				// that a listener can immediately send commands on the new session.
+				if ev, ok := ev.(*target.EventAttachedToTarget); ok {
+					b.registerAutoAttachedSession(ctx, ev.SessionID, ev.TargetInfo.TargetID)
+				}
+
 				b.listenersMu.Lock()
 				b.listeners = runListeners(b.listeners, ev)
 				b.listenersMu.Unlock()
@@ -318,15 +370,27 @@ func (b *Browser) run(ctx context.Context) {
 			b.pages[t.SessionID] = t
 
 		case sessionID := <-delTabQueue:
-			if _, ok := b.pages[sessionID]; !ok {
+			if _, ok := b.pages[sessionID]; ok {
+				delete(b.pages, sessionID)
+			} else if _, ok := b.autoAttachedSessions.LoadAndDelete(sessionID); ok {
+				// auto-attached session cleaned up
+			} else {
 				b.errf("executor for %q doesn't exist", sessionID)
 			}
-			delete(b.pages, sessionID)
 
 		case m := <-incomingQueue:
 			page, ok := b.pages[m.SessionID]
 			if !ok {
-				// A page we recently closed still sending events.
+				// Route to auto-attached session if registered; otherwise the
+				// session was recently closed and the event can be dropped.
+				if val, ok := b.autoAttachedSessions.Load(m.SessionID); ok {
+					t := val.(*Target)
+					select {
+					case <-ctx.Done():
+						return
+					case t.messageQueue <- m:
+					}
+				}
 				continue
 			}
 
