@@ -125,9 +125,21 @@ func (t *Target) run(ctx context.Context) {
 					t.errf("could not unmarshal event: %v", err)
 					continue
 				}
+
+				// Register auto-attached sessions before notifying listeners
+				// so that a listener can immediately use the new session.
+				if ev, ok := ev.(*target.EventAttachedToTarget); ok {
+					t.browser.registerAutoAttachedSession(ctx, ev.SessionID, ev.TargetInfo.TargetID)
+				}
+
 				t.listenersMu.Lock()
 				t.listeners = runListeners(t.listeners, ev)
 				t.listenersMu.Unlock()
+
+				// Clean up auto-attached sessions on detach.
+				if ev, ok := ev.(*target.EventDetachedFromTarget); ok {
+					t.browser.autoAttachedSessions.Delete(ev.SessionID)
+				}
 
 				switch msg.Method.Domain() {
 				case "Runtime", "Page", "DOM":
