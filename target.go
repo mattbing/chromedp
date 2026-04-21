@@ -136,9 +136,15 @@ func (t *Target) run(ctx context.Context) {
 				t.listeners = runListeners(t.listeners, ev)
 				t.listenersMu.Unlock()
 
-				// Clean up auto-attached sessions on detach.
+				// Clean up auto-attached sessions on detach. Firing cancel
+				// stops the Target.run goroutines we spawned in
+				// Browser.registerAutoAttachedSession; without this, nested
+				// subtargets whose detach arrives on a parent session's
+				// channel (instead of the browser channel) leak.
 				if ev, ok := ev.(*target.EventDetachedFromTarget); ok {
-					t.browser.autoAttachedSessions.Delete(ev.SessionID)
+					if val, ok := t.browser.autoAttachedSessions.LoadAndDelete(ev.SessionID); ok {
+						val.(*autoAttachedEntry).cancel()
+					}
 				}
 
 				switch msg.Method.Domain() {

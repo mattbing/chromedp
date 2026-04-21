@@ -64,8 +64,11 @@ type Browser struct {
 	// (EventAttachedToTarget) that were NOT created via AttachToTarget.
 	// These sessions are not in pages, so without this map their incoming
 	// messages would be silently dropped and commands on them would fail.
+	// Each entry owns the cancel func for the Target.run goroutine it
+	// spawned; the detach handler invokes cancel so those goroutines exit
+	// when Chrome reports the session is gone.
 	// Keyed by SessionID; concurrent access is safe via sync.Map.
-	autoAttachedSessions sync.Map // target.SessionID -> *Target
+	autoAttachedSessions sync.Map // target.SessionID -> *autoAttachedEntry
 
 	listenersMu sync.Mutex
 	listeners   []cancelableListener
@@ -94,6 +97,14 @@ type Browser struct {
 	// userDataDir can be initialized by the allocators which set up user
 	// data dirs directly.
 	userDataDir string
+}
+
+// autoAttachedEntry is a value stored in Browser.autoAttachedSessions. It
+// pairs the auto-attached Target with the cancel func for the goroutine
+// running Target.run, so the detach handler can stop that goroutine.
+type autoAttachedEntry struct {
+	target *Target
+	cancel context.CancelFunc
 }
 
 // NewBrowser creates a new browser. Typically, this function wouldn't be called
@@ -205,10 +216,13 @@ func (b *Browser) registerAutoAttachedSession(ctx context.Context, sessionID tar
 		logf:         b.logf,
 		errf:         b.errf,
 	}
-	if _, loaded := b.autoAttachedSessions.LoadOrStore(sessionID, t); loaded {
-		return // already registered
+	childCtx, cancel := context.WithCancel(ctx)
+	entry := &autoAttachedEntry{target: t, cancel: cancel}
+	if _, loaded := b.autoAttachedSessions.LoadOrStore(sessionID, entry); loaded {
+		cancel() // discard the duplicate child ctx
+		return
 	}
-	go t.run(ctx)
+	go t.run(childCtx)
 }
 
 // SessionExecutor returns a CDP executor for the given auto-attached session ID.
@@ -219,7 +233,7 @@ func (b *Browser) registerAutoAttachedSession(ctx context.Context, sessionID tar
 // Returns (executor, true) if the session is known, or (nil, false) if not.
 func (b *Browser) SessionExecutor(sessionID target.SessionID) (cdp.Executor, bool) {
 	if val, ok := b.autoAttachedSessions.Load(sessionID); ok {
-		return val.(*Target), true
+		return val.(*autoAttachedEntry).target, true
 	}
 	return nil, false
 }
@@ -355,6 +369,15 @@ func (b *Browser) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Safety net: cancel any auto-attached session goroutines still
+			// alive. Detach events normally clean these up via delTabQueue,
+			// but the WS may have dropped or Chrome may have crashed before
+			// emitting them.
+			b.autoAttachedSessions.Range(func(key, val any) bool {
+				val.(*autoAttachedEntry).cancel()
+				b.autoAttachedSessions.Delete(key)
+				return true
+			})
 			return
 
 		case msg := <-b.cmdQueue:
@@ -372,8 +395,8 @@ func (b *Browser) run(ctx context.Context) {
 		case sessionID := <-delTabQueue:
 			if _, ok := b.pages[sessionID]; ok {
 				delete(b.pages, sessionID)
-			} else if _, ok := b.autoAttachedSessions.LoadAndDelete(sessionID); ok {
-				// auto-attached session cleaned up
+			} else if val, ok := b.autoAttachedSessions.LoadAndDelete(sessionID); ok {
+				val.(*autoAttachedEntry).cancel()
 			} else {
 				b.errf("executor for %q doesn't exist", sessionID)
 			}
@@ -384,7 +407,7 @@ func (b *Browser) run(ctx context.Context) {
 				// Route to auto-attached session if registered; otherwise the
 				// session was recently closed and the event can be dropped.
 				if val, ok := b.autoAttachedSessions.Load(m.SessionID); ok {
-					t := val.(*Target)
+					t := val.(*autoAttachedEntry).target
 					select {
 					case <-ctx.Done():
 						return
