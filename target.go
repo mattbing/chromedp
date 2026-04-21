@@ -40,6 +40,12 @@ type Target struct {
 
 	// Indicates if the target is a worker target.
 	isWorker bool
+
+	// ctx is the context under which Target.run is running, populated at
+	// the top of run. Used by Browser.run's openerLookupQueue handler to
+	// hand back this Target's ctx as a parent for auto-attached children
+	// whose TargetInfo.OpenerID == this Target's TargetID.
+	ctx context.Context
 }
 
 func (t *Target) enclosingFrame(node *cdp.Node) cdp.FrameID {
@@ -88,6 +94,7 @@ func (t *Target) ensureFrame() (*cdp.Frame, *cdp.Node, runtime.ExecutionContextI
 }
 
 func (t *Target) run(ctx context.Context) {
+	t.ctx = ctx
 	type eventValue struct {
 		method cdproto.MethodType
 		value  any

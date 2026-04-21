@@ -70,6 +70,13 @@ type Browser struct {
 	// Keyed by SessionID; concurrent access is safe via sync.Map.
 	autoAttachedSessions sync.Map // target.SessionID -> *autoAttachedEntry
 
+	// openerLookupQueue is used by the ws-reader to ask Browser.run to
+	// resolve a TargetInfo.OpenerID (a TargetID) to the owning page's
+	// Target.run ctx, so auto-attached sessions registered from the
+	// browser root channel can be parented on that page's ctx and die
+	// via cascade when the page does.
+	openerLookupQueue chan openerLookupReq
+
 	listenersMu sync.Mutex
 	listeners   []cancelableListener
 
@@ -107,6 +114,31 @@ type autoAttachedEntry struct {
 	cancel context.CancelFunc
 }
 
+// openerLookupReq asks Browser.run to resolve a target ID against
+// b.pages. Used by the ws-reader before registering a browser-channel
+// auto-attached session. If the attached target's own TargetID is
+// already a managed page, ws-reader must skip registration entirely
+// (the session is a ghost duplicate). Otherwise, if the opener's
+// TargetID is a managed page, its ctx is returned as the parent for
+// the new auto-attached session so it cascade-dies with the page.
+type openerLookupReq struct {
+	// targetID is the TargetID of the attached target itself. If it
+	// matches a page in b.pages, resp is closed with skip=true.
+	targetID target.ID
+	// openerID is TargetInfo.OpenerID. May be empty. If set and
+	// matches a page in b.pages, resp returns that page's ctx.
+	openerID target.ID
+	resp     chan openerLookupResp
+}
+
+type openerLookupResp struct {
+	// skip is true when targetID is already in b.pages; ws-reader
+	// must not register this session in autoAttachedSessions.
+	skip bool
+	// ctx is the opener page's Target.run ctx, or nil if no match.
+	ctx context.Context
+}
+
 // NewBrowser creates a new browser. Typically, this function wouldn't be called
 // directly, as the Allocator interface takes care of it.
 func NewBrowser(ctx context.Context, urlstr string, opts ...BrowserOption) (*Browser, error) {
@@ -120,6 +152,9 @@ func NewBrowser(ctx context.Context, urlstr string, opts ...BrowserOption) (*Bro
 
 		// Fit some jobs without blocking, to reduce blocking in Execute.
 		cmdQueue: make(chan *cdproto.Message, 32),
+
+		// Buffered so the ws-reader doesn't block on a busy main loop.
+		openerLookupQueue: make(chan openerLookupReq, 8),
 
 		logf: log.Printf,
 	}
@@ -223,6 +258,13 @@ func (b *Browser) registerAutoAttachedSession(ctx context.Context, sessionID tar
 		return
 	}
 	go t.run(childCtx)
+	// Map-entry cleanup: when the session's ctx ends (via cascade from the
+	// parent target's ctx, explicit cancel on detach, or Browser.run safety
+	// net), remove the map entry. Idempotent with LoadAndDelete call sites.
+	go func() {
+		<-childCtx.Done()
+		b.autoAttachedSessions.Delete(sessionID)
+	}()
 }
 
 // SessionExecutor returns a CDP executor for the given auto-attached session ID.
@@ -342,8 +384,36 @@ func (b *Browser) run(ctx context.Context) {
 
 				// Register auto-attached sessions before notifying listeners so
 				// that a listener can immediately send commands on the new session.
+				// Ask Browser.run (the only safe reader of b.pages) whether
+				// this target is already a managed page (skip registration —
+				// it'd be a ghost duplicate) and, if not, whether the opener
+				// is a managed page (use its ctx as parent so this session
+				// cascade-dies with the opener).
 				if ev, ok := ev.(*target.EventAttachedToTarget); ok {
-					b.registerAutoAttachedSession(ctx, ev.SessionID, ev.TargetInfo.TargetID)
+					resp := make(chan openerLookupResp, 1)
+					req := openerLookupReq{
+						targetID: ev.TargetInfo.TargetID,
+						openerID: ev.TargetInfo.OpenerID,
+						resp:     resp,
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case b.openerLookupQueue <- req:
+					}
+					var lookup openerLookupResp
+					select {
+					case <-ctx.Done():
+						return
+					case lookup = <-resp:
+					}
+					if !lookup.skip {
+						parent := ctx
+						if lookup.ctx != nil {
+							parent = lookup.ctx
+						}
+						b.registerAutoAttachedSession(parent, ev.SessionID, ev.TargetInfo.TargetID)
+					}
 				}
 
 				b.listenersMu.Lock()
@@ -370,9 +440,10 @@ func (b *Browser) run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			// Safety net: cancel any auto-attached session goroutines still
-			// alive. Detach events normally clean these up via delTabQueue,
+			// alive. Detach events and ctx cascade normally clean these up,
 			// but the WS may have dropped or Chrome may have crashed before
-			// emitting them.
+			// emitting them, and workers without an opener are parented on
+			// this very ctx.
 			b.autoAttachedSessions.Range(func(key, val any) bool {
 				val.(*autoAttachedEntry).cancel()
 				b.autoAttachedSessions.Delete(key)
@@ -391,6 +462,15 @@ func (b *Browser) run(ctx context.Context) {
 				b.errf("executor for %q already exists", t.SessionID)
 			}
 			b.pages[t.SessionID] = t
+			// Chrome emits EventAttachedToTarget on the browser channel for
+			// sessions created via an explicit AttachToTarget call too, so
+			// the ws-reader may have already shadow-registered this session
+			// in autoAttachedSessions with Browser ctx as parent. That entry
+			// is redundant — message routing and command sending both go
+			// through b.pages — so cancel and remove the ghost.
+			if val, ok := b.autoAttachedSessions.LoadAndDelete(t.SessionID); ok {
+				val.(*autoAttachedEntry).cancel()
+			}
 
 		case sessionID := <-delTabQueue:
 			if _, ok := b.pages[sessionID]; ok {
@@ -400,6 +480,24 @@ func (b *Browser) run(ctx context.Context) {
 			} else {
 				b.errf("executor for %q doesn't exist", sessionID)
 			}
+
+		case req := <-b.openerLookupQueue:
+			var resp openerLookupResp
+			for _, t := range b.pages {
+				if t.TargetID == req.targetID {
+					resp.skip = true
+					break
+				}
+			}
+			if !resp.skip && req.openerID != "" {
+				for _, t := range b.pages {
+					if t.TargetID == req.openerID {
+						resp.ctx = t.ctx
+						break
+					}
+				}
+			}
+			req.resp <- resp
 
 		case m := <-incomingQueue:
 			page, ok := b.pages[m.SessionID]
