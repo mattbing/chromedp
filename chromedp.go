@@ -357,7 +357,13 @@ func (c *Context) newTarget(ctx context.Context) error {
 			c.Target.cur = tree.Frame.ID
 			c.Target.frameMu.Unlock()
 
-			c.Target.documentUpdated(ctx)
+			// documentUpdated would race here with the run loop that
+			// attachTarget just spawned: documentUpdated writes f.Nodes
+			// under f.Lock, while domEvent reads f.Nodes outside f.Lock
+			// (e.g. childNodeInserted). Callers that need DOM-domain
+			// helpers (OuterHTML, query selectors) trigger initialization
+			// on demand; callers that only use Evaluate/CaptureScreenshot
+			// don't need it at all.
 		}
 		return nil
 	}
