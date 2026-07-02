@@ -15,9 +15,29 @@ import (
 // see [RunResponse].
 type NavigateAction Action
 
-// Navigate is an action that navigates the current frame.
+// Navigate is an action that navigates the current frame, waiting for the load
+// event to fire.
 func Navigate(urlstr string) NavigateAction {
-	return responseAction(nil, ActionFunc(func(ctx context.Context) error {
+	return responseAction(nil, false, ActionFunc(func(ctx context.Context) error {
+		switch _, _, errorText, _, err := page.Navigate(urlstr).Do(ctx); {
+		case err != nil:
+			return err
+		case errorText != "":
+			return fmt.Errorf("page load error %s", errorText)
+		}
+		return nil
+	}))
+}
+
+// NavigateDOMContentLoaded is like [Navigate] but returns as soon as the
+// DOMContentLoaded lifecycle event fires (the DOM is parsed) instead of waiting
+// for the full load event. This is the right choice for pages whose load event
+// is delayed indefinitely by a long tail of subresources (ads, trackers, lazy
+// media); the caller is expected to do its own bounded network-settle wait
+// afterward. Redirect spanning and synchronous/async navigation-error detection
+// are identical to [Navigate].
+func NavigateDOMContentLoaded(urlstr string) NavigateAction {
+	return responseAction(nil, true, ActionFunc(func(ctx context.Context) error {
 		switch _, _, errorText, _, err := page.Navigate(urlstr).Do(ctx); {
 		case err != nil:
 			return err
@@ -45,13 +65,13 @@ func NavigationEntries(currentIndex *int64, entries *[]*page.NavigationEntry) Ac
 // NavigateToHistoryEntry is an action to navigate to the specified navigation
 // entry.
 func NavigateToHistoryEntry(entryID int64) NavigateAction {
-	return responseAction(nil, page.NavigateToHistoryEntry(entryID))
+	return responseAction(nil, false, page.NavigateToHistoryEntry(entryID))
 }
 
 // NavigateBack is an action that navigates the current frame backwards in its
 // history.
 func NavigateBack() NavigateAction {
-	return responseAction(nil, ActionFunc(func(ctx context.Context) error {
+	return responseAction(nil, false, ActionFunc(func(ctx context.Context) error {
 		cur, entries, err := page.GetNavigationHistory().Do(ctx)
 		if err != nil {
 			return err
@@ -69,7 +89,7 @@ func NavigateBack() NavigateAction {
 // NavigateForward is an action that navigates the current frame forwards in
 // its history.
 func NavigateForward() NavigateAction {
-	return responseAction(nil, ActionFunc(func(ctx context.Context) error {
+	return responseAction(nil, false, ActionFunc(func(ctx context.Context) error {
 		cur, entries, err := page.GetNavigationHistory().Do(ctx)
 		if err != nil {
 			return err
@@ -86,7 +106,7 @@ func NavigateForward() NavigateAction {
 
 // Reload is an action that reloads the current page.
 func Reload() NavigateAction {
-	return responseAction(nil, page.Reload())
+	return responseAction(nil, false, page.Reload())
 }
 
 // Stop is an action that stops all navigation and pending resource retrieval.

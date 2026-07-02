@@ -563,13 +563,19 @@ func WithBrowserOption(opts ...BrowserOption) ContextOption {
 // block until the context is cancelled.
 func RunResponse(ctx context.Context, actions ...Action) (*network.Response, error) {
 	var resp *network.Response
-	if err := Run(ctx, responseAction(&resp, actions...)); err != nil {
+	if err := Run(ctx, responseAction(&resp, false, actions...)); err != nil {
 		return nil, err
 	}
 	return resp, nil
 }
 
-func responseAction(resp **network.Response, actions ...Action) Action {
+// responseAction runs actions and blocks until the navigation they trigger has
+// finished loading. When waitDCL is false it finishes on the load event (or
+// frameStoppedLoading); when waitDCL is true it also finishes on the
+// DOMContentLoaded lifecycle event, i.e. as soon as the DOM is parsed rather
+// than after all subresources load. All other handling (redirect spanning,
+// init-gating, and net-error fast-bail) is identical.
+func responseAction(resp **network.Response, waitDCL bool, actions ...Action) Action {
 	return ActionFunc(func(ctx context.Context) error {
 		// loaderID lets us filter the requests from the currently
 		// loading navigation.
@@ -616,6 +622,15 @@ func responseAction(resp **network.Response, actions ...Action) Action {
 			case *page.EventLifecycleEvent:
 				if ev.FrameID == frameID && ev.Name == "init" {
 					hasInit = true
+				}
+				// When the caller only wants DOMContentLoaded, finish as soon
+				// as the DOM is parsed rather than waiting for the load event
+				// (which never fires within a sane window on ad/tracker-heavy
+				// pages). Gated on hasInit so a stale DCL from a prior
+				// navigation on a reused target is ignored.
+				if waitDCL && hasInit && ev.FrameID == frameID && ev.Name == "DOMContentLoaded" {
+					finished = true
+					lcancel()
 				}
 			case *page.EventLoadEventFired:
 				// Ignore load events before the "init"
