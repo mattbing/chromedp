@@ -21,7 +21,20 @@ func Navigate(urlstr string) Action[Void] {
 // NavigateResponse is like [Navigate], and returns the HTTP response of the
 // HTML document.
 func NavigateResponse(urlstr string) Action[*network.Response] {
-	return responseAction(navigate(urlstr))
+	return responseAction(false, navigate(urlstr))
+}
+
+// NavigateDOMContentLoaded is like [Navigate], but it returns at the
+// DOMContentLoaded lifecycle event, when the DOM is parsed, instead of waiting
+// for the load event. Use it for a page whose subresources, such as ads, delay
+// the load event for a long time. Wait for the network afterwards with your own
+// limit. It handles redirects and navigation errors like [Navigate].
+func NavigateDOMContentLoaded(urlstr string) Action[Void] {
+	r := responseAction(true, navigate(urlstr))
+	return func(ctx context.Context, t *Target) (Void, error) {
+		_, err := r(ctx, t)
+		return Void{}, err
+	}
 }
 
 // navigate is the action that sends Page.navigate, without waiting for the

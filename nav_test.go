@@ -100,6 +100,9 @@ func TestNavigateLoadError(t *testing.T) {
 			_, err := Run(ctx, NavigateResponse(urlstr))
 			return err
 		},
+		"NavigateDOMContentLoaded": func(ctx context.Context) error {
+			return Do(ctx, NavigateDOMContentLoaded(urlstr))
+		},
 		"RunResponse": func(ctx context.Context) error {
 			_, err := RunResponse(ctx, Navigate(urlstr))
 			return err
@@ -339,6 +342,48 @@ func TestNavigateContextTimeout(t *testing.T) {
 
 	if err := Do(ctx, Navigate(s.URL)); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+}
+
+// TestNavigateDOMContentLoaded checks that NavigateDOMContentLoaded returns
+// when the DOM is parsed, while an image still holds the load event back.
+func TestNavigateDOMContentLoaded(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := testAllocate(t, "")
+	defer cancel()
+
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.Handle("/", writeHTML(`<html><body><p id="parsed">parsed</p><img src="/slow.png"></body></html>`))
+	mux.HandleFunc("/slow.png", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	// Release the image before Close, which waits for its handler.
+	defer close(release)
+
+	// The image does not load before the test ends, so Navigate waits until
+	// this timeout, and a regression fails here.
+	navCtx, navCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer navCancel()
+	if err := Do(navCtx, NavigateDOMContentLoaded(s.URL)); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := Run(ctx, Evaluate[string](`document.readyState`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == "complete" {
+		t.Fatalf("the page loaded, so the test does not show that the action returned early")
+	}
+	if _, err := Run(ctx, Text(CSS("#parsed"))); err != nil {
+		t.Fatalf("reading the parsed DOM: %v", err)
 	}
 }
 
