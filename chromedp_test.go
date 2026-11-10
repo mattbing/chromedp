@@ -1218,6 +1218,106 @@ func TestAttachingToWorkers(t *testing.T) {
 	}
 }
 
+// TestAttachingToPausedIframe attaches to an out-of-process iframe while it
+// waits for the debugger. The attach must not run JavaScript in the iframe,
+// because an evaluation there does not return until the iframe runs. The
+// session that the browser auto-attached must accept the command that
+// resumes the iframe.
+func TestAttachingToPausedIframe(t *testing.T) {
+	t.Parallel()
+
+	frameServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, `<html><body>frame</body></html>`)
+	}))
+	defer frameServer.Close()
+	// The page is on 127.0.0.1 and the iframe on localhost. They are
+	// different sites, so the browser puts the iframe in its own process.
+	frameURL := strings.Replace(frameServer.URL, "127.0.0.1", "localhost", 1) + "/"
+
+	pageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><body><iframe src=%q></iframe></body></html>`, frameURL)
+	}))
+	defer pageServer.Close()
+
+	// headless-shell does not isolate every site by default.
+	opts := append(allocOpts[:len(allocOpts):len(allocOpts)], Flag("site-per-process", true))
+	actx, cancel := NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+	ctx, cancel := NewContext(actx, browserOpts...)
+	defer cancel()
+
+	ctx, timeoutCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer timeoutCancel()
+
+	if err := Do(ctx, Func(func(ctx context.Context, t *Target) error {
+		_, err := cdp.Call(ctx, t, target.SetAutoAttach, target.SetAutoAttachParams{
+			AutoAttach:             true,
+			WaitForDebuggerOnStart: true,
+			Flatten:                ptr(true),
+		})
+		return err
+	})); err != nil {
+		t.Fatal(err)
+	}
+	attached := Events(ctx, target.AttachedToTarget)
+	// Do not wait for the load event. The page does not load while its
+	// iframe waits for the debugger.
+	if err := Do(ctx, Func(func(ctx context.Context, t *Target) error {
+		_, err := cdp.Call(ctx, t, page.Navigate, page.NavigateParams{URL: pageServer.URL})
+		return err
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	var ev target.EventAttachedToTarget
+	for e, err := range attached {
+		if err != nil {
+			t.Fatalf("waiting for the iframe target: %v", err)
+		}
+		if e.TargetInfo != nil && e.TargetInfo.Type == "iframe" {
+			ev = e
+			break
+		}
+	}
+	if !ev.WaitingForDebugger {
+		t.Fatal("the iframe target does not wait for the debugger")
+	}
+
+	// Attach while the iframe waits. The target runs with the context of
+	// this first Do, so give it a limit that the steps below share too, and
+	// check the time of the attach on its own.
+	frameCtx, frameCancel := NewContext(ctx, WithTargetID(ev.TargetInfo.TargetID))
+	defer frameCancel()
+	frameCtx, frameTimeoutCancel := context.WithTimeout(frameCtx, 20*time.Second)
+	defer frameTimeoutCancel()
+	start := time.Now()
+	if err := Do(frameCtx, Func(func(ctx context.Context, t *Target) error {
+		_, err := cdp.Call(ctx, t, network.Enable, network.EnableParams{})
+		return err
+	})); err != nil {
+		t.Fatalf("attaching to the paused iframe: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("the attach to the paused iframe took %v", d)
+	}
+
+	session, ok := FromContext(ctx).Browser.AutoAttachedSession(ev.SessionID)
+	if !ok {
+		t.Fatalf("the auto-attached session %s is unknown", ev.SessionID)
+	}
+	if _, err := cdp.Call(ctx, session, runtime.RunIfWaitingForDebugger, cdp.Empty{}); err != nil {
+		t.Fatalf("resuming the iframe: %v", err)
+	}
+
+	// The iframe runs now, so an evaluation in it returns.
+	loaded := fmt.Sprintf(`document.readyState === "complete" && location.href === %q`, frameURL)
+	if _, err := Run(frameCtx, Poll[bool](loaded)); err != nil {
+		t.Fatalf("waiting for the iframe to load: %v", err)
+	}
+}
+
 // TestAutoAttachedSessionDetach checks the life of a session that the browser
 // auto-attached: a worker of a tab. The session is known while the worker
 // runs. After the worker ends, it is unknown, and a command on it fails with

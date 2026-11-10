@@ -586,17 +586,21 @@ func (c *Context) attachTarget(ctx context.Context, targetID target.ID) error {
 
 	go c.Target.run(ctx)
 
-	// Find out whether this is a worker target. A worker cannot use
-	// Target.getTargetInfo or Target.getTargets, so find out whether "self"
-	// refers to a WorkerGlobalScope or a ServiceWorkerGlobalScope.
-	if _, err := cdp.Call(ctx, c.Target, runtime.Enable, cdp.Empty{}); err != nil {
-		return err
-	}
-	self, err := cdp.Call(ctx, c.Target, runtime.Evaluate, runtime.EvaluateParams{Expression: "self"})
+	// Find out whether this is a worker target. Ask the browser, because a
+	// worker cannot answer Target.getTargetInfo. Do not evaluate "self" in the
+	// target: the evaluation does not return while the target waits for the
+	// debugger, such as a paused out-of-process iframe.
+	info, err := cdp.Call(ctx, c.Browser, target.GetTargetInfo, target.GetTargetInfoParams{TargetID: targetID})
 	if err != nil {
 		return err
 	}
-	c.Target.isWorker = strings.Contains(self.Result.ClassName, "WorkerGlobalScope")
+	switch info.TargetInfo.Type {
+	case "worker", "shared_worker", "service_worker":
+		c.Target.isWorker = true
+	}
+	if _, err := cdp.Call(ctx, c.Target, runtime.Enable, cdp.Empty{}); err != nil {
+		return err
+	}
 
 	// Enable available domains and discover targets.
 	type step struct {
