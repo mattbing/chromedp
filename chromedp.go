@@ -832,12 +832,14 @@ func WithBrowserOption(opts ...BrowserOption) ContextOption {
 // If the actions trigger no navigation, RunResponse blocks until the context
 // is canceled.
 func RunResponse(ctx context.Context, steps ...Action[Void]) (*network.Response, error) {
-	return Run(ctx, responseAction(steps...))
+	return Run(ctx, responseAction(false, steps...))
 }
 
 // responseAction makes an action that runs the steps, waits until the page
-// loads, and returns the response of the HTML document.
-func responseAction(steps ...Action[Void]) Action[*network.Response] {
+// loads, and returns the response of the HTML document. When waitDCL is true,
+// the page counts as loaded at its DOMContentLoaded lifecycle event, when the
+// DOM is parsed, rather than at its load event.
+func responseAction(waitDCL bool, steps ...Action[Void]) Action[*network.Response] {
 	return func(ctx context.Context, t *Target) (*network.Response, error) {
 		var resp *network.Response
 		// loaderID lets us filter the requests of the navigation that
@@ -887,6 +889,12 @@ func responseAction(steps ...Action[Void]) Action[*network.Response] {
 			case *page.EventLifecycleEvent:
 				if ev.FrameID == frameID && ev.Name == "init" {
 					hasInit = true
+				}
+				// Ignore a DOMContentLoaded before the "init" lifecycle
+				// event, as it belongs to an earlier navigation.
+				if waitDCL && hasInit && ev.FrameID == frameID && ev.Name == "DOMContentLoaded" {
+					finished = true
+					lcancel()
 				}
 			case *page.EventLoadEventFired:
 				// Ignore load events before the "init"
@@ -978,7 +986,7 @@ func responseAction(steps ...Action[Void]) Action[*network.Response] {
 // waitLoad makes an action that runs the steps and waits until the page loads.
 // It does not return the response.
 func waitLoad(steps ...Action[Void]) Action[Void] {
-	r := responseAction(steps...)
+	r := responseAction(false, steps...)
 	return func(ctx context.Context, t *Target) (Void, error) {
 		_, err := r(ctx, t)
 		return Void{}, err
