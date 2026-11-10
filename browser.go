@@ -85,6 +85,26 @@ type Browser struct {
 	// that the tests can read the map after a browser closes.
 	pages map[target.SessionID]*Target
 
+	// autoAttachedSessions tracks the sessions that Target.setAutoAttach
+	// creates (EventAttachedToTarget), as opposed to the sessions of an
+	// explicit Target.attachToTarget. Those are not in pages, so without this
+	// map their messages are dropped and commands on them fail.
+	// Each entry owns the cancel func of the Target.run goroutine that it
+	// started, so a detach can stop it.
+	autoAttachedSessions sync.Map // target.SessionID -> *autoAttachedEntry
+
+	// autoAttachQueue lets the goroutine that reads the connection ask run,
+	// the only reader of pages, to register a session that the browser
+	// auto-attached and reported on the browser channel.
+	autoAttachQueue chan autoAttachReq
+
+	// attaching counts, by target ID, the explicit attaches that
+	// Context.attachTarget runs now. The browser also reports an explicit
+	// attach on the browser channel, and run must not register that report
+	// as an auto-attached session.
+	attachingMu sync.Mutex
+	attaching   map[target.ID]int
+
 	listenersMu sync.Mutex
 	listeners   []cancelableListener
 
@@ -132,6 +152,21 @@ type Browser struct {
 	wsURL    string
 }
 
+// autoAttachedEntry is a value of Browser.autoAttachedSessions. It pairs the
+// auto-attached Target with the cancel func of the goroutine that runs
+// Target.run, so that a detach can stop that goroutine.
+type autoAttachedEntry struct {
+	target *Target
+	cancel context.CancelFunc
+}
+
+// autoAttachReq asks Browser.run to register the session of ev. run closes
+// done when it is finished.
+type autoAttachReq struct {
+	ev   *target.EventAttachedToTarget
+	done chan struct{}
+}
+
 // NewBrowserTransport creates a new browser that uses tr, a connection to a
 // browser that is already open, such as a [*PipeConn]. The browser closes tr
 // when it stops. Typically you do not call it directly, because the Allocator
@@ -158,6 +193,9 @@ func newBrowser(opts []BrowserOption) *Browser {
 
 		// Fit some jobs without blocking, to reduce blocking in Execute.
 		cmdQueue: make(chan *cdproto.Message, 32),
+
+		autoAttachQueue: make(chan autoAttachReq),
+		attaching:       make(map[target.ID]int),
 
 		logf: log.Printf,
 	}
@@ -197,7 +235,24 @@ func (b *Browser) newTarget(ctx context.Context, targetID target.ID, sessionID t
 	if sessionID == "" {
 		return nil, errors.New("empty session ID")
 	}
-	t := &Target{
+	// The caller runs the target with ctx. Set it before the send, so that
+	// run can read it after it receives the target.
+	t := b.makeTarget(targetID, sessionID)
+	t.ctx = ctx
+
+	// This send must block, so that the tab is in the map before any more
+	// target events are routed.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case b.newTabQueue <- t:
+	}
+	return t, nil
+}
+
+// makeTarget returns a Target for the session, which does not run yet.
+func (b *Browser) makeTarget(targetID target.ID, sessionID target.SessionID) *Target {
+	return &Target{
 		browser:   b,
 		TargetID:  targetID,
 		SessionID: sessionID,
@@ -212,15 +267,74 @@ func (b *Browser) newTarget(ctx context.Context, targetID target.ID, sessionID t
 		logf: b.logf,
 		errf: b.errf,
 	}
+}
 
-	// This send must block, so that the tab is in the map before any more
-	// target events are routed.
+// registerAutoAttachedSession starts a Target for a session that the browser
+// auto-attached (EventAttachedToTarget), rather than one of an explicit
+// Target.attachToTarget. The Target is registered in autoAttachedSessions, so
+// that its messages are routed and commands can be sent on it. Pass the
+// context of the target that opened or holds the session as ctx, so that the
+// session ends with that target.
+// Only the first call for a session ID takes effect.
+func (b *Browser) registerAutoAttachedSession(ctx context.Context, sessionID target.SessionID, targetID target.ID) {
+	if sessionID == "" || targetID == "" {
+		return
+	}
+	t := b.makeTarget(targetID, sessionID)
+	childCtx, cancel := context.WithCancel(ctx)
+	t.ctx = childCtx
+	entry := &autoAttachedEntry{target: t, cancel: cancel}
+	if _, loaded := b.autoAttachedSessions.LoadOrStore(sessionID, entry); loaded {
+		cancel()
+		return
+	}
+	go t.run(childCtx)
+	go func() {
+		// The session ends at its detach, at the end of its parent, or at
+		// the end of the browser. In each case, fail the pending commands
+		// with ErrTargetDetached, stop the target and remove the map entry.
+		select {
+		case <-t.detached:
+		case <-childCtx.Done():
+		}
+		t.markDetached()
+		cancel()
+		b.autoAttachedSessions.CompareAndDelete(sessionID, entry)
+	}()
+}
+
+// detachAutoAttachedSession routes a detach to an auto-attached session. The
+// session stops after it handles the messages queued before the detach.
+func (b *Browser) detachAutoAttachedSession(ctx context.Context, sessionID target.SessionID) bool {
+	val, ok := b.autoAttachedSessions.LoadAndDelete(sessionID)
+	if !ok {
+		return false
+	}
+	entry := val.(*autoAttachedEntry)
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case b.newTabQueue <- t:
+	case <-entry.target.ctx.Done():
+	case entry.target.messageQueue <- detachedMessage:
 	}
-	return t, nil
+	return true
+}
+
+// AutoAttachedSession returns the session of a target that the browser
+// auto-attached with Target.setAutoAttach, such as an out-of-process iframe.
+// Use it, for example, to call Runtime.runIfWaitingForDebugger on a target
+// that waits for the debugger.
+//
+// The session is known before the funcs of [Listen] and [ListenBrowser] get
+// its Target.attachedToTarget event, so such a func can look it up at once.
+// It returns false for an unknown session, and again after the session
+// detaches or its parent ends. Its commands then fail with ErrTargetDetached.
+// The session has no domain enabled. Do not run actions with it. To run
+// actions in the target, use [WithTargetID].
+func (b *Browser) AutoAttachedSession(sessionID target.SessionID) (cdp.Session, bool) {
+	if val, ok := b.autoAttachedSessions.Load(sessionID); ok {
+		return val.(*autoAttachedEntry).target, true
+	}
+	return nil, false
 }
 
 // Call sends the command to the browser, waits for the response, and decodes
@@ -379,6 +493,25 @@ func (b *Browser) run(ctx context.Context) {
 					b.errf("%s", err)
 					continue
 				}
+
+				// Register an auto-attached session before the listeners
+				// run, so that a listener can send commands on it at once.
+				if ev, ok := ev.(*target.EventAttachedToTarget); ok && ev.TargetInfo != nil {
+					req := autoAttachReq{ev: ev, done: make(chan struct{})}
+					select {
+					case <-ctx.Done():
+						b.lostReason = ctx.Err()
+						return
+					case b.autoAttachQueue <- req:
+					}
+					select {
+					case <-ctx.Done():
+						b.lostReason = ctx.Err()
+						return
+					case <-req.done:
+					}
+				}
+
 				b.listenersMu.Lock()
 				b.listeners = runListeners(b.listeners, ev)
 				b.listenersMu.Unlock()
@@ -404,6 +537,14 @@ func (b *Browser) run(ctx context.Context) {
 	}()
 
 	b.pages = make(map[target.SessionID]*Target, 32)
+	// Stop the auto-attached sessions that remain. Detaches and the end of
+	// their parents normally stop them, but the connection can drop first,
+	// and a session without a known opener has the browser ctx as its parent.
+	defer b.autoAttachedSessions.Range(func(key, val any) bool {
+		val.(*autoAttachedEntry).cancel()
+		b.autoAttachedSessions.Delete(key)
+		return true
+	})
 	for {
 		select {
 		case <-ctx.Done():
@@ -420,12 +561,25 @@ func (b *Browser) run(ctx context.Context) {
 				b.errf("executor for %q already exists", t.SessionID)
 			}
 			b.pages[t.SessionID] = t
+			// The browser also reports an explicit attach on the browser
+			// channel, so the reader can have registered this session as an
+			// auto-attached one. pages routes it now, so stop the duplicate.
+			if val, ok := b.autoAttachedSessions.LoadAndDelete(t.SessionID); ok {
+				val.(*autoAttachedEntry).cancel()
+			}
+
+		case req := <-b.autoAttachQueue:
+			b.registerFromBrowserChannel(ctx, req.ev)
+			close(req.done)
 
 		case m := <-incomingQueue:
 			if m.msg == nil {
 				sessionID := m.detached
 				if _, ok := b.pages[sessionID]; !ok {
-					b.errf("executor for %q doesn't exist", sessionID)
+					if !b.detachAutoAttachedSession(ctx, sessionID) {
+						b.errf("executor for %q doesn't exist", sessionID)
+					}
+					continue
 				}
 				if page, ok := b.pages[sessionID]; ok {
 					// Tell the target after its last routed message. The target
@@ -442,7 +596,19 @@ func (b *Browser) run(ctx context.Context) {
 
 			page, ok := b.pages[m.msg.SessionID]
 			if !ok {
-				// A page that we closed recently still sends events.
+				val, ok := b.autoAttachedSessions.Load(m.msg.SessionID)
+				if !ok {
+					// A page that we closed recently still sends events.
+					continue
+				}
+				page = val.(*autoAttachedEntry).target
+				select {
+				case <-ctx.Done():
+					return
+				case <-page.ctx.Done():
+					// The session ended, and nobody reads its queue.
+				case page.messageQueue <- m.msg:
+				}
 				continue
 			}
 
@@ -456,6 +622,46 @@ func (b *Browser) run(ctx context.Context) {
 			return // to avoid "write: broken pipe" errors
 		}
 	}
+}
+
+// registerFromBrowserChannel registers a session that the browser
+// auto-attached and reported on the browser channel. The session ends with the
+// page that opened it, or with the browser when no page did. Only run calls it,
+// because it reads pages.
+func (b *Browser) registerFromBrowserChannel(ctx context.Context, ev *target.EventAttachedToTarget) {
+	if _, ok := b.pages[ev.SessionID]; ok || b.isAttaching(ev.TargetInfo.TargetID) {
+		return // the report of an explicit attach
+	}
+	parent := ctx
+	for _, t := range b.pages {
+		if t.TargetID == ev.TargetInfo.OpenerID {
+			parent = t.ctx
+			break
+		}
+	}
+	b.registerAutoAttachedSession(parent, ev.SessionID, ev.TargetInfo.TargetID)
+}
+
+// beginAttach and endAttach mark the explicit attach of a target. See
+// Browser.attaching.
+func (b *Browser) beginAttach(id target.ID) {
+	b.attachingMu.Lock()
+	b.attaching[id]++
+	b.attachingMu.Unlock()
+}
+
+func (b *Browser) endAttach(id target.ID) {
+	b.attachingMu.Lock()
+	if b.attaching[id]--; b.attaching[id] <= 0 {
+		delete(b.attaching, id)
+	}
+	b.attachingMu.Unlock()
+}
+
+func (b *Browser) isAttaching(id target.ID) bool {
+	b.attachingMu.Lock()
+	defer b.attachingMu.Unlock()
+	return b.attaching[id] > 0
 }
 
 // sessionMessage is an item of the queue from the goroutine that reads the

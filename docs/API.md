@@ -601,7 +601,7 @@ wg.Wait()
 
 ### 19. Work in an iframe from another site
 
-Chrome runs an iframe from another site (a cross-site iframe) in its own process, as a separate target of the type `iframe`. The node of the `iframe` element has no `ContentDocument`, so `FromNode` finds nothing in it. `chromedp` does not attach to the iframe target by itself, because it ignores `Target.attachedToTarget` for it. The network events of the iframe do not reach the context of the page. An iframe from the same site is not affected. This example has no Before block, because the old API had the same limit.
+Chrome runs an iframe from another site (a cross-site iframe) in its own process, as a separate target of the type `iframe`. The node of the `iframe` element has no `ContentDocument`, so `FromNode` finds nothing in it. `chromedp` tracks the session that the browser attaches to the iframe target, but no context runs actions in it. The network events of the iframe do not reach the context of the page. An iframe from the same site is not affected. This example has no Before block, because the old API had the same limit.
 
 To work in the iframe, attach to its target with `WithTargetID`. The new context runs actions in the iframe and gets its events. The parent context must have run once, so that it has a browser.
 
