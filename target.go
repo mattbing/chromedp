@@ -532,19 +532,28 @@ func (t *Target) pageEvent(ev any) {
 
 // domEvent handles incoming DOM events.
 func (t *Target) domEvent(ctx context.Context, ev any) {
+	if _, ok := ev.(*dom.EventDocumentUpdated); ok {
+		t.dropWorlds("")
+		t.documentUpdated(ctx)
+		return
+	}
+
 	t.frameMu.RLock()
 	f := t.frames[t.cur]
 	t.frameMu.RUnlock()
+	if f == nil {
+		return
+	}
+
+	// documentUpdated replaces f.Nodes under the lock, so read f.Nodes, and
+	// build and apply the op, under the lock too.
+	f.Lock()
+	defer f.Unlock()
 
 	var id cdp.NodeID
 	var op nodeOp
 
 	switch e := ev.(type) {
-	case *dom.EventDocumentUpdated:
-		t.dropWorlds("")
-		t.documentUpdated(ctx)
-		return
-
 	case *dom.EventSetChildNodes:
 		id, op = e.ParentID, setChildNodes(f.Nodes, newNodes(e.Nodes))
 
@@ -618,7 +627,5 @@ func (t *Target) domEvent(ctx context.Context, ev any) {
 		return
 	}
 
-	f.Lock()
 	op(n)
-	f.Unlock()
 }
