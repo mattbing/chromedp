@@ -1218,6 +1218,81 @@ func TestAttachingToWorkers(t *testing.T) {
 	}
 }
 
+// TestAutoAttachedSessionDetach checks the life of a session that the browser
+// auto-attached: a worker of a tab. The session is known while the worker
+// runs. After the worker ends, it is unknown, and a command on it fails with
+// ErrTargetDetached. The explicit session of the tab is not an auto-attached
+// session.
+func TestAutoAttachedSessionDetach(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.Handle("/", writeHTML(`<html><body><script>window.w = new Worker('/worker.js')</script></body></html>`))
+	mux.HandleFunc("/worker.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript")
+		io.WriteString(w, "setInterval(() => {}, 1000);")
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	ctx, cancel := testAllocate(t, "")
+	defer cancel()
+	ctx, timeoutCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer timeoutCancel()
+
+	attached := Events(ctx, target.AttachedToTarget)
+	detached := Events(ctx, target.DetachedFromTarget)
+	if err := Do(ctx, Navigate(ts.URL)); err != nil {
+		t.Fatal(err)
+	}
+
+	var ev target.EventAttachedToTarget
+	for e, err := range attached {
+		if err != nil {
+			t.Fatalf("waiting for the worker target: %v", err)
+		}
+		if e.TargetInfo != nil && e.TargetInfo.Type == "worker" {
+			ev = e
+			break
+		}
+	}
+
+	c := FromContext(ctx)
+	session, ok := c.Browser.AutoAttachedSession(ev.SessionID)
+	if !ok {
+		t.Fatalf("the session %s of the worker is unknown", ev.SessionID)
+	}
+	if _, ok := c.Browser.AutoAttachedSession(c.Target.SessionID); ok {
+		t.Error("the explicit session of the tab is an auto-attached session")
+	}
+
+	if err := Do(ctx, Evaluate[Void](`w.terminate()`)); err != nil {
+		t.Fatal(err)
+	}
+	for e, err := range detached {
+		if err != nil {
+			t.Fatalf("waiting for the detach of the worker: %v", err)
+		}
+		if e.SessionID == ev.SessionID {
+			break
+		}
+	}
+	for {
+		if _, ok := c.Browser.AutoAttachedSession(ev.SessionID); !ok {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("the session of the worker is still known after its detach")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	_, err := cdp.Call(ctx, session, runtime.Evaluate, runtime.EvaluateParams{Expression: "1"})
+	if !errors.Is(err, ErrTargetDetached) {
+		t.Errorf("want ErrTargetDetached from a command on the detached session, got %v", err)
+	}
+}
+
 func TestRunResponse(t *testing.T) {
 	t.Parallel()
 

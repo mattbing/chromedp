@@ -561,6 +561,8 @@ func (c *Context) newTarget(ctx context.Context) error {
 }
 
 func (c *Context) attachTarget(ctx context.Context, targetID target.ID) error {
+	c.Browser.beginAttach(targetID)
+	defer c.Browser.endAttach(targetID)
 	res, err := cdp.Call(ctx, c.Browser, target.AttachToTarget, target.AttachToTargetParams{
 		TargetID: targetID,
 		Flatten:  ptr(true),

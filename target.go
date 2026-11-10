@@ -57,6 +57,22 @@ type Target struct {
 
 	// isWorker is true when the target is a worker target.
 	isWorker bool
+
+	// ctx is the context that the target runs with. It is set before the
+	// target is shared. Browser.run gives it as the parent to the sessions
+	// that this target opens, so that they end with it. This breaks the rule
+	// to keep no context in a struct, because only run can find the opener of
+	// a session, and it needs the context of that opener.
+	ctx context.Context
+
+	// detachOnce closes detached once. See markDetached.
+	detachOnce sync.Once
+}
+
+// markDetached closes detached, so that the pending and the later commands of
+// the target fail with ErrTargetDetached. It is safe to call more than once.
+func (t *Target) markDetached() {
+	t.detachOnce.Do(func() { close(t.detached) })
 }
 
 func (t *Target) enclosingFrame(node *Node) cdp.FrameID {
@@ -127,7 +143,7 @@ func (t *Target) run(ctx context.Context) {
 
 			case msg := <-t.messageQueue:
 				if msg == detachedMessage {
-					close(t.detached)
+					t.markDetached()
 					continue
 				}
 				if msg.ID != 0 {
@@ -148,9 +164,26 @@ func (t *Target) run(ctx context.Context) {
 					t.errf("could not unmarshal event: %v", err)
 					continue
 				}
+
+				// Register a session that the browser auto-attached to this
+				// target before the listeners run, so that a listener can
+				// send commands on it at once.
+				if ev, ok := ev.(*target.EventAttachedToTarget); ok && ev.TargetInfo != nil {
+					t.browser.registerAutoAttachedSession(ctx, ev.SessionID, ev.TargetInfo.TargetID)
+				}
+
 				t.listenersMu.Lock()
 				t.listeners = runListeners(t.listeners, ev)
 				t.listenersMu.Unlock()
+
+				// The detach of a session nested in this target arrives on
+				// this target's channel, not on the browser channel. Stop the
+				// session without a send to its queue, which can be full.
+				if ev, ok := ev.(*target.EventDetachedFromTarget); ok {
+					if val, ok := t.browser.autoAttachedSessions.LoadAndDelete(ev.SessionID); ok {
+						val.(*autoAttachedEntry).cancel()
+					}
+				}
 
 				switch msg.Method.Domain() {
 				case "Runtime", "Page", "DOM":
